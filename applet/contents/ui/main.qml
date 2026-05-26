@@ -213,10 +213,13 @@ PlasmoidItem {
                     id: pinButton
                     checkable: true
                     checked: Plasmoid.configuration.keepOpenOnActivate
-                    icon.name: "window-pin"
-                    text: i18n("Pin")
+                    display: QQC2.AbstractButton.TextBesideIcon
+                    icon.name: checked ? "window-pin" : "window-unpin"
+                    text: checked ? i18n("Pinned") : i18n("Pin")
                     onToggled: Plasmoid.configuration.keepOpenOnActivate = checked
-                    QQC2.ToolTip.text: i18n("Keep the list open after focusing a window")
+                    QQC2.ToolTip.text: checked
+                        ? i18n("Pinned: the list stays open after you focus a window, so you can keep picking. Click to unpin.")
+                        : i18n("Pin: keep the list open after focusing a window (otherwise it closes). Esc or clicking the icon still closes it.")
                     QQC2.ToolTip.visible: hovered
                     QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
                 }
