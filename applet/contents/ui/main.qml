@@ -6,13 +6,14 @@
 
     (C) Roberto Di Cosmo 2026 -  SPDX-License-Identifier: MIT
 
-    NB: unlike the ~/bin/kwin-focus CLI, an applet runs *inside* plasmashell,
+    NB: unlike the cli/kwin-focus tool, an applet runs *inside* plasmashell,
     so it uses TaskManager.TasksModel directly — none of the KWin-scripting /
     journal exfiltration dance is needed here.
 */
 
 import QtQuick 2.15
 import QtQuick.Layouts 1.10
+import QtQuick.Controls 2.15 as QQC2
 
 import org.kde.plasma.plasmoid 2.0
 import org.kde.plasma.core as PlasmaCore
@@ -29,13 +30,35 @@ PlasmoidItem {
     switchWidth: Kirigami.Units.gridUnit * 12
     switchHeight: Kirigami.Units.gridUnit * 12
 
+    // Pin: keep the popup open across focus changes so you can keep navigating.
+    // hideOnWindowDeactivate is a PlasmoidItem property (not on the attached Plasmoid).
+    hideOnWindowDeactivate: !Plasmoid.configuration.keepOpenOnActivate
+
     // The text typed in the search field; drives the proxy filter.
     property string filterText: ""
+
+    // Map the persisted sort-mode string to the TasksModel enum.
+    function tmSortMode(s) {
+        if (s === "lru")      return TaskManager.TasksModel.SortLastActivated;
+        if (s === "activity") return TaskManager.TasksModel.SortActivity;
+        return TaskManager.TasksModel.SortAlpha;
+    }
+    // Cycle the persisted sort mode (alpha -> lru -> activity -> alpha).
+    function cycleSort() {
+        const order = ["alpha", "lru", "activity"];
+        const i = order.indexOf(Plasmoid.configuration.sortMode);
+        Plasmoid.configuration.sortMode = order[(i + 1) % order.length];
+    }
+    function sortLabel(s) {
+        if (s === "lru")      return i18n("Recent");
+        if (s === "activity") return i18n("Activity");
+        return i18n("A–Z");
+    }
 
     // All windows everywhere, ungrouped (defaults: no desktop/activity filtering).
     TaskManager.TasksModel {
         id: tasksModel
-        sortMode: TaskManager.TasksModel.SortAlpha
+        sortMode: root.tmSortMode(Plasmoid.configuration.sortMode)
         groupMode: TaskManager.TasksModel.GroupDisabled
     }
 
@@ -55,13 +78,14 @@ PlasmoidItem {
         }
     }
 
-    // Focus the window at the given *proxy* row, then close the popup.
+    // Focus the window at the given *proxy* row, then close the popup (unless pinned).
     function activateRow(proxyRow) {
         if (proxyRow < 0 || proxyRow >= filterModel.count)
             return;
         const sourceRow = filterModel.mapToSource(filterModel.index(proxyRow, 0)).row;
         tasksModel.requestActivate(tasksModel.makeModelIndex(sourceRow));
-        root.expanded = false;
+        if (!Plasmoid.configuration.keepOpenOnActivate)
+            root.expanded = false;
     }
 
     fullRepresentation: FocusScope {
@@ -89,35 +113,62 @@ PlasmoidItem {
             anchors.fill: parent
             spacing: Kirigami.Units.smallSpacing
 
-            Kirigami.SearchField {
-                id: searchField
+            // ---- header: search + sort cycle + pin ----
+            RowLayout {
                 Layout.fillWidth: true
-                focus: true
-                placeholderText: i18n("Filter by title or application…")
+                spacing: Kirigami.Units.smallSpacing
 
-                onTextChanged: {
-                    root.filterText = text;
-                    filterModel.invalidateFilter();
-                    listView.currentIndex = filterModel.count > 0 ? 0 : -1;
-                }
-                // Down arrow dives into the result list.
-                Keys.onDownPressed: {
-                    if (listView.count > 0) {
-                        listView.currentIndex = 0;
-                        listView.forceActiveFocus();
+                Kirigami.SearchField {
+                    id: searchField
+                    Layout.fillWidth: true
+                    focus: true
+                    placeholderText: i18n("Filter by title or application…")
+
+                    onTextChanged: {
+                        root.filterText = text;
+                        filterModel.invalidateFilter();
+                        listView.currentIndex = filterModel.count > 0 ? 0 : -1;
+                    }
+                    Keys.onDownPressed: {
+                        if (listView.count > 0) {
+                            listView.currentIndex = 0;
+                            listView.forceActiveFocus();
+                        }
+                    }
+                    Keys.onReturnPressed: root.activateRow(listView.currentIndex >= 0 ? listView.currentIndex : 0)
+                    Keys.onEnterPressed:  root.activateRow(listView.currentIndex >= 0 ? listView.currentIndex : 0)
+                    Keys.onEscapePressed: {
+                        if (text.length > 0)
+                            text = "";
+                        else
+                            root.expanded = false;
                     }
                 }
-                // Enter activates the highlighted row (first one by default).
-                Keys.onReturnPressed: root.activateRow(listView.currentIndex >= 0 ? listView.currentIndex : 0)
-                Keys.onEnterPressed:  root.activateRow(listView.currentIndex >= 0 ? listView.currentIndex : 0)
-                Keys.onEscapePressed: {
-                    if (text.length > 0)
-                        text = "";
-                    else
-                        root.expanded = false;
+
+                QQC2.ToolButton {
+                    id: sortButton
+                    text: root.sortLabel(Plasmoid.configuration.sortMode)
+                    icon.name: "view-sort"
+                    onClicked: root.cycleSort()
+                    QQC2.ToolTip.text: i18n("Sort order — click to cycle (Alphabetical / Recent / Activity)")
+                    QQC2.ToolTip.visible: hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                }
+
+                QQC2.ToolButton {
+                    id: pinButton
+                    checkable: true
+                    checked: Plasmoid.configuration.keepOpenOnActivate
+                    icon.name: "window-pin"
+                    text: i18n("Pin")
+                    onToggled: Plasmoid.configuration.keepOpenOnActivate = checked
+                    QQC2.ToolTip.text: i18n("Keep the list open after focusing a window")
+                    QQC2.ToolTip.visible: hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
                 }
             }
 
+            // ---- the window list ----
             PlasmaComponents.ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -179,7 +230,6 @@ PlasmoidItem {
 
                     Keys.onReturnPressed: root.activateRow(currentIndex)
                     Keys.onEnterPressed:  root.activateRow(currentIndex)
-                    // Up at the top hands focus back to the search field.
                     Keys.onUpPressed: {
                         if (currentIndex <= 0) {
                             currentIndex = 0;

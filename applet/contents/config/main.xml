@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="sortMode" type="String">
+        <label>Order of the window list: alpha, lru, or activity</label>
+        <default>alpha</default>
+    </entry>
+    <entry name="keepOpenOnActivate" type="Bool">
+        <label>Keep the list open after focusing a window (pin)</label>
+        <default>false</default>
+    </entry>
+    <entry name="showActivityColumn" type="Bool">
+        <label>Show the Activity each window lives on</label>
+        <default>true</default>
+    </entry>
+  </group>
+
+</kcfg>
