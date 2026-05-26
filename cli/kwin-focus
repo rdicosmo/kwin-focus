@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+#
+# kwin-focus — list and focus application windows on KDE Plasma 6 (X11 or Wayland).
+#
+# Replaces wmctrl/xdotool workflows that are broken on Plasma 6 (no Wayland,
+# no Activities). Talks to KWin via its Scripting D-Bus interface, reads the
+# script's output back from the systemd *user* journal, and resolves Activity
+# UUIDs to human-readable names via the ActivityManager D-Bus service.
+#
+# How the I/O works (verified on Plasma/KWin 6.3.6): a KWin script's print()
+# output lands in the user journal as `kwin_x11[pid]: js: <msg>`. We tag every
+# line with a unique run id and read it back with `journalctl --user`. NB: the
+# earlier design read kDebug via `journalctl --user -u plasma-kwin_x11.service`
+# and saw nothing — kwin is not a user systemd *unit*, so that filter matches
+# nothing. Dropping the -u filter is the fix. (callDBus()+dbus-monitor also
+# works as a channel; print()-to-journal is cleaner to parse, so we use it.)
+#
+# (C) Roberto Di Cosmo 2026 -
+#
+# Usage:
+#   kwin-focus                 # interactive picker (fzf if present, else menu)
+#   kwin-focus -l, --list      # plain table, no focusing
+#   kwin-focus -j, --json      # JSON array (pipe to jq)
+#   kwin-focus -p, --pattern P # focus first window whose class/name/title matches regex P
+#   kwin-focus -d, --debug     # dump raw KWin-script journal output to stderr
+#   kwin-focus -h, --help
+#
+# Requires: bash, qdbus6 (or qdbus), journalctl, awk, sed.
+# Optional: fzf (nicer picker).
+
+set -uo pipefail
+
+PROG="${0##*/}"
+
+# Field separators between KWin and us — control chars that never appear in titles.
+US=$'\037'   # unit sep  -> between fields of a record
+GS=$'\036'   # group sep -> between elements of a multi-valued field (desktops, activities)
+
+DEBUG=0
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+dbg()  { (( DEBUG )) && printf '[debug] %s\n' "$*" >&2 || true; }
+
+# --------------------------------------------------------------------------- #
+# Dependencies
+# --------------------------------------------------------------------------- #
+QDBUS=""
+check_deps() {
+  for c in qdbus6 qdbus-qt6 qdbus; do
+    if have "$c"; then QDBUS="$c"; break; fi
+  done
+  [[ -n "$QDBUS" ]] || die "need qdbus6 or qdbus (apt install qt6-tools-dev-tools)."
+  have journalctl || die "need journalctl (the KWin-script output channel)."
+  have awk        || die "need awk."
+  "$QDBUS" org.kde.KWin / >/dev/null 2>&1 \
+    || die "org.kde.KWin not on the session bus — is a KDE Plasma session running?"
+}
+
+# --------------------------------------------------------------------------- #
+# Run a KWin JavaScript snippet ($1) and return the journal lines it print()ed
+# that carry our unique run id ($2). The snippet MUST finish by printing a line
+# "<RUNID>_END". Returns the data lines (END sentinel stripped).
+# --------------------------------------------------------------------------- #
+kwin_run() {
+  local js="$1" runid="$2"
+  local jsfile; jsfile="$(mktemp --tmpdir kwin-focus.XXXXXX.js)" || die "mktemp failed"
+  printf '%s\n' "$js" >"$jsfile"
+
+  # Wall-clock cursor: race-free and bounded regardless of journal volume.
+  local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  local sid
+  sid="$("$QDBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$jsfile" "$runid" 2>/dev/null)"
+  if ! [[ "$sid" =~ ^[0-9]+$ ]]; then
+    rm -f "$jsfile"; die "KWin loadScript failed (got: '${sid:-<empty>}'). Is Plasma running?"
+  fi
+  dbg "loaded sid=$sid runid=$runid"
+  "$QDBUS" org.kde.KWin "/Scripting/Script$sid" org.kde.kwin.Script.run  >/dev/null 2>&1
+  "$QDBUS" org.kde.KWin "/Scripting/Script$sid" org.kde.kwin.Script.stop >/dev/null 2>&1
+
+  local out="" i
+  for ((i=0; i<60; i++)); do
+    out="$(journalctl --user -o cat -q --since "$since" 2>/dev/null | sed -n 's/^js: //p' | grep -F "$runid" || true)"
+    grep -q "${runid}_END" <<<"$out" && break
+    sleep 0.05
+  done
+  "$QDBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$runid" >/dev/null 2>&1
+  rm -f "$jsfile"
+
+  if (( DEBUG )); then
+    printf '[debug] raw journal capture for %s:\n' "$runid" >&2
+    printf '%s\n' "$out" | sed 's/^/[debug]   /' >&2
+  fi
+  grep -q "${runid}_END" <<<"$out" \
+    || die "no output from KWin script (journal channel silent). Re-run with -d; verify 'journalctl --user' shows kwin 'js:' lines."
+  grep -v "${runid}_END" <<<"$out" || true
+}
+
+# --------------------------------------------------------------------------- #
+# Activity name resolution (lazy + cached).
+# --------------------------------------------------------------------------- #
+declare -A ACT_NAME=()
+activity_name() {
+  local uuid="$1"
+  if [[ -z "${ACT_NAME[$uuid]:-}" ]]; then
+    local n
+    n="$("$QDBUS" org.kde.ActivityManager /ActivityManager/Activities \
+            org.kde.ActivityManager.Activities.ActivityName "$uuid" 2>/dev/null)"
+    ACT_NAME[$uuid]="${n:-$uuid}"
+  fi
+  printf '%s' "${ACT_NAME[$uuid]}"
+}
+current_activity() {
+  "$QDBUS" org.kde.ActivityManager /ActivityManager/Activities \
+      org.kde.ActivityManager.Activities.CurrentActivity 2>/dev/null
+}
+
+# --------------------------------------------------------------------------- #
+# Listing. One US-separated record per normal window, into WIN_REC[].
+# Record fields (after the RUNID prefix is stripped):
+#   iid US class US name US min US onAllDesk US onAllAct US deskNames(GS)
+#       US deskNums(GS) US actUuids(GS) US caption
+# --------------------------------------------------------------------------- #
+declare -a WIN_REC=()
+
+list_js() {
+  local runid="$1"
+  cat <<EOF
+var R="$runid";
+var US=String.fromCharCode(31), GS=String.fromCharCode(30);
+function clean(s){ s=""+s;
+  return s.split(US).join(" ").split(GS).join(" ").split("\\n").join(" ").split("\\r").join(" "); }
+var wins = workspace.windowList();
+for (var i=0;i<wins.length;i++){
+  var w=wins[i];
+  if (!w.normalWindow) continue;
+  var dn=[], dnum=[];
+  if (w.desktops){ for(var d=0; d<w.desktops.length; d++){ dn.push(clean(w.desktops[d].name)); dnum.push(""+w.desktops[d].x11DesktopNumber); } }
+  var hasAct = (w.activities && w.activities.length>0);
+  print(R + US + (""+w.internalId) + US + clean(w.resourceClass) + US + clean(w.resourceName)
+        + US + (w.minimized?1:0) + US + (w.onAllDesktops?1:0) + US + (hasAct?0:1)
+        + US + dn.join(GS) + US + dnum.join(GS) + US + (hasAct?w.activities.join(GS):"") + US + clean(w.caption));
+}
+print(R + "_END count=" + wins.length);
+EOF
+}
+
+load_windows() {
+  local runid="kwinfocus_list_$$_${RANDOM}"
+  local raw; raw="$(kwin_run "$(list_js "$runid")" "$runid")"
+  WIN_REC=()
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    line="${line#${runid}${US}}"
+    WIN_REC+=("$line")
+  done <<<"$raw"
+  (( ${#WIN_REC[@]} )) || die "no normal windows found."
+}
+
+# Split one record into F_* globals.
+declare -g F_IID F_CLASS F_NAME F_MIN F_ALLDESK F_ALLACT F_DESKN F_DESKNUM F_ACTS F_CAP
+parse_rec() {
+  local IFS="$US"
+  read -r F_IID F_CLASS F_NAME F_MIN F_ALLDESK F_ALLACT F_DESKN F_DESKNUM F_ACTS F_CAP <<<"$1"
+}
+
+rec_activity_names() {
+  [[ "$F_ALLACT" == 1 || -z "$F_ACTS" ]] && { printf 'all'; return; }
+  local out="" u IFS="$GS"
+  for u in $F_ACTS; do out+="${out:+,}$(activity_name "$u")"; done
+  printf '%s' "$out"
+}
+rec_desktop_names() {
+  [[ "$F_ALLDESK" == 1 || -z "$F_DESKN" ]] && { printf 'all'; return; }
+  printf '%s' "${F_DESKN//$GS/,}"
+}
+rec_state() { [[ "$F_MIN" == 1 ]] && printf 'minimized' || printf 'visible'; }
+
+# --------------------------------------------------------------------------- #
+# Table
+# --------------------------------------------------------------------------- #
+print_table() {
+  load_windows
+  {
+    printf 'IDX%sID%sDESKTOP%sACTIVITY%sCLASS%sSTATE%sTITLE\n' "$US" "$US" "$US" "$US" "$US" "$US"
+    local i
+    for i in "${!WIN_REC[@]}"; do
+      parse_rec "${WIN_REC[$i]}"
+      printf '%d%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+        $((i+1)) "$US" "$F_IID" "$US" "$(rec_desktop_names)" "$US" \
+        "$(rec_activity_names)" "$US" "$F_CLASS" "$US" "$(rec_state)" "$US" "$F_CAP"
+    done
+  } | awk -F"$US" '
+    { for(c=1;c<=NF;c++){ v[NR,c]=$c; if(length($c)>w[c]) w[c]=length($c) } if(NF>maxc)maxc=NF }
+    END{ for(r=1;r<=NR;r++){ line=""
+           for(c=1;c<maxc;c++) line=line sprintf("%-*s  ", w[c], v[r,c])
+           print line v[r,maxc] } }'   # last column (TITLE) unpadded
+}
+
+# --------------------------------------------------------------------------- #
+# JSON
+# --------------------------------------------------------------------------- #
+json_escape() {
+  local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+json_strarray() {  # GS-joined list -> JSON array of strings
+  local item first=1 IFS="$GS"
+  printf '['
+  for item in $1; do (( first )) || printf ','; first=0; printf '"%s"' "$(json_escape "$item")"; done
+  printf ']'
+}
+print_json() {
+  load_windows
+  local i first=1
+  printf '['
+  for i in "${!WIN_REC[@]}"; do
+    parse_rec "${WIN_REC[$i]}"
+    (( first )) || printf ','; first=0
+    local actnames="" u IFS="$GS"
+    if [[ "$F_ALLACT" != 1 && -n "$F_ACTS" ]]; then
+      for u in $F_ACTS; do actnames+="${actnames:+$GS}$(activity_name "$u")"; done
+    fi
+    unset IFS
+    printf '\n  {"index":%d,"id":"%s","desktops":%s,"activities":%s,"onAllDesktops":%s,"onAllActivities":%s,"class":"%s","name":"%s","minimized":%s,"title":"%s"}' \
+      $((i+1)) "$(json_escape "$F_IID")" \
+      "$( [[ "$F_ALLDESK" == 1 ]] && printf '[]' || json_strarray "$F_DESKN" )" \
+      "$( [[ "$F_ALLACT"  == 1 ]] && printf '[]' || json_strarray "$actnames" )" \
+      "$( [[ "$F_ALLDESK" == 1 ]] && echo true || echo false )" \
+      "$( [[ "$F_ALLACT"  == 1 ]] && echo true || echo false )" \
+      "$(json_escape "$F_CLASS")" "$(json_escape "$F_NAME")" \
+      "$( [[ "$F_MIN" == 1 ]] && echo true || echo false )" \
+      "$(json_escape "$F_CAP")"
+  done
+  printf '\n]\n'
+}
+
+# --------------------------------------------------------------------------- #
+# Focus the window described by the current F_* record:
+#   1. switch Activity via ActivityManager D-Bus if needed (reliable from bash)
+#   2. KWin script: unminimize + switch virtual desktop + raise + activate
+# --------------------------------------------------------------------------- #
+focus_current_rec() {
+  local iid="$F_IID"
+
+  if [[ "$F_ALLACT" != 1 && -n "$F_ACTS" ]]; then
+    local cur want="" u found=0 IFS="$GS"
+    cur="$(current_activity)"
+    for u in $F_ACTS; do
+      [[ "$u" == "$cur" ]] && { found=1; break; }
+      [[ -z "$want" ]] && want="$u"
+    done
+    unset IFS
+    if (( ! found )) && [[ -n "$want" ]]; then
+      dbg "switching activity -> $(activity_name "$want")"
+      "$QDBUS" org.kde.ActivityManager /ActivityManager/Activities \
+          org.kde.ActivityManager.Activities.SetCurrentActivity "$want" >/dev/null 2>&1
+      local j; for ((j=0;j<20;j++)); do [[ "$(current_activity)" == "$want" ]] && break; sleep 0.05; done
+    fi
+  fi
+
+  local runid="kwinfocus_focus_$$_${RANDOM}"
+  local js
+  js="$(cat <<EOF
+var R="$runid", TID="$iid";
+var wins=workspace.windowList(), w=null;
+for (var i=0;i<wins.length;i++){ if((""+wins[i].internalId)===TID){ w=wins[i]; break; } }
+if(!w){ print(R+" FAIL notfound"); }
+else{
+  w.minimized=false;
+  if(!w.onAllDesktops && w.desktops && w.desktops.length>=1){ workspace.currentDesktop = w.desktops[0]; }
+  workspace.raiseWindow(w);
+  workspace.activeWindow = w;   // deferred by KWin; do not read back in this tick
+  print(R+" OK "+w.caption);
+}
+print(R+"_END");
+EOF
+)"
+  local res; res="$(kwin_run "$js" "$runid")"
+  grep -q "$runid OK" <<<"$res" \
+    || die "could not focus window $iid (it may have closed)."
+  printf 'focused: %s — %s\n' "$F_CLASS" "$F_CAP" >&2
+}
+
+# --------------------------------------------------------------------------- #
+# Pick-a-window modes
+# --------------------------------------------------------------------------- #
+focus_by_pattern() {
+  local pat="$1"; load_windows
+  local i
+  shopt -s nocasematch
+  for i in "${!WIN_REC[@]}"; do
+    parse_rec "${WIN_REC[$i]}"
+    if [[ "$F_CLASS" =~ $pat || "$F_NAME" =~ $pat || "$F_CAP" =~ $pat ]]; then
+      shopt -u nocasematch; focus_current_rec; return 0
+    fi
+  done
+  shopt -u nocasematch
+  die "no window matches /$pat/ (class or title)."
+}
+
+interactive_pick() {
+  load_windows
+  local i menu="" line sel
+  for i in "${!WIN_REC[@]}"; do
+    parse_rec "${WIN_REC[$i]}"
+    local mark=""; [[ "$F_MIN" == 1 ]] && mark=" [min]"
+    line="$(printf '%3d  [%s] %-18s %s%s' $((i+1)) "$(rec_activity_names)" "$F_CLASS" "$F_CAP" "$mark")"
+    menu+="$line"$'\n'
+  done
+
+  if have fzf; then
+    sel="$(printf '%s' "$menu" | fzf --prompt='focus window > ' --reverse --height=50% --no-sort || true)"
+    [[ -z "$sel" ]] && { echo "cancelled." >&2; return 1; }
+    i="$(awk '{print $1}' <<<"$sel")"
+  else
+    printf '%s' "$menu" >&2
+    printf 'Pick a window number (or q to quit): ' >&2
+    read -r i || return 1
+    [[ "$i" == q* || -z "$i" ]] && { echo "cancelled." >&2; return 1; }
+  fi
+
+  [[ "$i" =~ ^[0-9]+$ ]] || die "not a number: '$i'"
+  (( i>=1 && i<=${#WIN_REC[@]} )) || die "out of range: $i"
+  parse_rec "${WIN_REC[$((i-1))]}"
+  focus_current_rec
+}
+
+# --------------------------------------------------------------------------- #
+usage() {
+  cat <<EOF
+$PROG — list and focus KDE Plasma 6 windows (X11 & Wayland), Activities-aware.
+
+  $PROG                 interactive picker (fzf if present, else numbered menu)
+  $PROG -l | --list     table of all normal windows
+  $PROG -j | --json     same data as a JSON array (pipe to jq)
+  $PROG -p RE | --pattern RE
+                        focus first window whose class/name/title matches the
+                        case-insensitive regex RE (non-interactive; for keybinds)
+  $PROG -d | --debug    dump raw KWin-script journal output to stderr (composable)
+  $PROG -h | --help     this help
+
+Windows are tracked internally by KWin's stable internalId, not the printed
+index (indexes change between runs). Focusing un-minimizes the window and
+switches virtual desktop AND Activity as needed.
+EOF
+}
+
+main() {
+  local mode="interactive" pattern=""
+  while (( $# )); do
+    case "$1" in
+      -l|--list)    mode="list" ;;
+      -j|--json)    mode="json" ;;
+      -p|--pattern) mode="pattern"; shift; [[ $# -ge 1 ]] || die "-p needs a PATTERN"; pattern="$1" ;;
+      -d|--debug)   DEBUG=1 ;;
+      -h|--help)    usage; exit 0 ;;
+      --)           shift; break ;;
+      -*)           die "unknown option: $1 (try -h)" ;;
+      *)            mode="pattern"; pattern="$1" ;;
+    esac
+    shift
+  done
+
+  check_deps
+  case "$mode" in
+    list)        print_table ;;
+    json)        print_json ;;
+    pattern)     focus_by_pattern "$pattern" ;;
+    interactive) interactive_pick ;;
+  esac
+}
+
+main "$@"
