@@ -11,6 +11,7 @@
     journal exfiltration dance is needed here.
 */
 
+import QtQml 2.15
 import QtQuick 2.15
 import QtQuick.Layouts 1.10
 import QtQuick.Controls 2.15 as QQC2
@@ -21,6 +22,7 @@ import org.kde.plasma.components as PlasmaComponents
 import org.kde.kirigami 2.20 as Kirigami
 import org.kde.taskmanager 0.1 as TaskManager
 import org.kde.kitemmodels as KItemModels
+import org.kde.activities 0.1 as Activities
 
 PlasmoidItem {
     id: root
@@ -55,6 +57,46 @@ PlasmoidItem {
         return i18n("A–Z");
     }
 
+    // ---- Activity id -> name resolution (for the activity column + filtering) ----
+    property var activityNames: ({})
+
+    Activities.ActivityModel { id: activityModel }
+
+    // Each activity row exposes id/name (confirmed role names: model.id/model.name).
+    Instantiator {
+        model: activityModel
+        delegate: QtObject {
+            readonly property string aid: model.id
+            readonly property string aname: model.name
+            function sync() {
+                const m = Object.assign({}, root.activityNames);
+                m[aid] = aname;
+                root.activityNames = m;   // new reference so bindings re-evaluate
+            }
+            onAnameChanged: sync()
+            Component.onCompleted: sync()
+        }
+    }
+
+    // Column text: "All" when the window is on every activity.
+    function activityDisplay(acts) {
+        if (!acts || acts.length === 0)
+            return i18n("All");
+        let names = [];
+        for (let i = 0; i < acts.length; i++)
+            names.push(root.activityNames[acts[i]] || acts[i]);
+        return names.join(", ");
+    }
+    // Activity names joined for matching in the text filter ("" when on all).
+    function activityFilterText(acts) {
+        if (!acts || acts.length === 0)
+            return "";
+        let names = [];
+        for (let i = 0; i < acts.length; i++)
+            names.push(root.activityNames[acts[i]] || "");
+        return names.join(" ");
+    }
+
     // All windows everywhere, ungrouped (defaults: no desktop/activity filtering).
     TaskManager.TasksModel {
         id: tasksModel
@@ -72,9 +114,11 @@ PlasmoidItem {
             const idx = tasksModel.index(sourceRow, 0, sourceParent);
             const title = String(tasksModel.data(idx, Qt.DisplayRole) || "");
             const app = String(tasksModel.data(idx, TaskManager.AbstractTasksModel.AppName) || "");
+            const acts = root.activityFilterText(tasksModel.data(idx, TaskManager.AbstractTasksModel.Activities));
             const needle = root.filterText.toLowerCase();
             return title.toLowerCase().indexOf(needle) !== -1
-                || app.toLowerCase().indexOf(needle) !== -1;
+                || app.toLowerCase().indexOf(needle) !== -1
+                || acts.toLowerCase().indexOf(needle) !== -1;
         }
     }
 
@@ -223,6 +267,18 @@ PlasmoidItem {
                                     textFormat: Text.PlainText
                                     elide: Text.ElideRight
                                 }
+                            }
+                            // Activity column (right-aligned, dim) — optional.
+                            PlasmaComponents.Label {
+                                visible: Plasmoid.configuration.showActivityColumn
+                                Layout.alignment: Qt.AlignVCenter
+                                Layout.maximumWidth: Kirigami.Units.gridUnit * 8
+                                horizontalAlignment: Text.AlignRight
+                                text: root.activityDisplay(model.Activities)
+                                opacity: 0.6
+                                font: Kirigami.Theme.smallFont
+                                textFormat: Text.PlainText
+                                elide: Text.ElideRight
                             }
                         }
                         onClicked: root.activateRow(index)
