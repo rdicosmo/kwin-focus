@@ -36,6 +36,19 @@ PlasmoidItem {
     // hideOnWindowDeactivate is a PlasmoidItem property (not on the attached Plasmoid).
     hideOnWindowDeactivate: !Plasmoid.configuration.keepOpenOnActivate
 
+    // Global shortcut: a keypress summons the list on whatever Activity you're on.
+    // activationTogglesExpanded makes the shortcut open/close the popup; we seed a
+    // default key only when none is set, so we never clobber a user's own choice
+    // (Plasma persists globalShortcut). Change it in the widget's keyboard-shortcut
+    // settings or System Settings.
+    Component.onCompleted: {
+        if (Plasmoid.hasOwnProperty("activationTogglesExpanded"))
+            Plasmoid.activationTogglesExpanded = true;
+        if (Plasmoid.hasOwnProperty("globalShortcut")
+                && (!Plasmoid.globalShortcut || String(Plasmoid.globalShortcut) === ""))
+            Plasmoid.globalShortcut = "Meta+W";
+    }
+
     // The text typed in the search field; drives the proxy filter.
     property string filterText: ""
 

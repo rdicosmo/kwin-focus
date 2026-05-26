@@ -10,7 +10,7 @@ virtual desktops and Activities, and focus the one you want*:
 | | |
 |---|---|
 | **`cli/kwin-focus`** | a self-contained bash tool: list (`-l`), JSON (`-j`), pattern-focus (`-p RE`, ideal for global keybindings), and an interactive picker (fzf or a numbered menu). |
-| **`applet/`** ("Window Filter") | a Plasma 6 panel/dock applet: a search box over a live window list. Filter by title / application / **Activity name**, navigate with the **arrow keys** (↓ into the list, ↑/↓ to move, Enter to focus, Esc to clear/close). Toggle the sort order (Alphabetical / Most-recently-used / By-activity), **pin** the list open to keep navigating, and show each window's Activity. Configure defaults in the widget settings. |
+| **`applet/`** ("Window Filter") | a Plasma 6 panel/dock applet: a search box over a live window list. Filter by title / application / **Activity name**, navigate with the **arrow keys** (↓ into the list, ↑/↓ to move, Enter to focus, Esc to clear/close). Toggle the sort order (Most-recently-used by default / Alphabetical / By-activity), **pin** the list open to keep navigating, and show each window's Activity. A **global shortcut** (default **Meta+W**, changeable in the widget's keyboard-shortcut settings) summons it on whatever Activity you're on. Configure defaults in the widget settings. |
 
 ## How it works (the interesting part)
 
