@@ -1,0 +1,21 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Roberto Di Cosmo"
+            }
+        ],
+        "Category": "Windows and Tasks",
+        "Description": "Filter all open windows by title or application and focus one — fully keyboard-navigable. Activating a window switches virtual desktop and Activity as needed.",
+        "Icon": "preferences-system-windows",
+        "Id": "org.dicosmo.windowfilter",
+        "License": "MIT",
+        "Name": "Window Filter",
+        "Version": "1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-Provides": [
+        "org.kde.plasma.multitasking"
+    ]
+}
