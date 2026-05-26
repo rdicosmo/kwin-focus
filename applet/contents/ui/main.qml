@@ -97,12 +97,22 @@ PlasmoidItem {
         return names.join(" ");
     }
 
+    // TasksModel sorting needs these helper objects in scope: without them,
+    // changing sortMode dereferences a null VirtualDesktopInfo inside the sort
+    // comparator and crashes (confirmed via core dump). Mirror the stock Task
+    // Manager wiring.
+    TaskManager.VirtualDesktopInfo { id: virtualDesktopInfo }
+    TaskManager.ActivityInfo { id: activityInfo }
+
     // All windows everywhere, ungrouped (defaults: no desktop/activity filtering).
     TaskManager.TasksModel {
         id: tasksModel
+        virtualDesktop: virtualDesktopInfo.currentDesktop
+        activity: activityInfo.currentActivity
         sortMode: root.tmSortMode(Plasmoid.configuration.sortMode)
         groupMode: TaskManager.TasksModel.GroupDisabled
     }
+
 
     // Substring match on BOTH window title and application name (case-insensitive).
     KItemModels.KSortFilterProxyModel {
